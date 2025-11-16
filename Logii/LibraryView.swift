@@ -25,10 +25,20 @@ struct LibraryView: View {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 20) {
                         ForEach(pdfURLs, id: \.self) { url in
-                            NavigationLink(destination: FileImportView(url: url)) {
-                                PDFThumbnailView(url: url)
+                            // Wrap the link in a VStack to attach onAppear/onDisappear
+                            // This ensures we have access for the thumbnail and for navigation.
+                            VStack {
+                                NavigationLink(destination: FileImportView(url: url)) {
+                                    PDFThumbnailView(url: url)
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
+                            .onAppear {
+                                _ = url.startAccessingSecurityScopedResource()
+                            }
+                            .onDisappear {
+                                url.stopAccessingSecurityScopedResource()
+                            }
                         }
                     }
                     .padding()

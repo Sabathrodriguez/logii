@@ -61,10 +61,6 @@ struct FileImportView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .ignoresSafeArea(edges: .all)
                     .onAppear {
-                        // Start accessing the security-scoped resource every time the view appears.
-                        let didStartAccessing = url.startAccessingSecurityScopedResource()
-                        if !didStartAccessing { print("Failed to start access for \(url.lastPathComponent)") }
-
                         // Load the most recent bookmark every time the view appears.
                         let pageToLoad = BookmarkManager.shared.loadBookmark(for: url)?.pageIndex ?? 0
                         self.initialPageIndex = pageToLoad
@@ -73,10 +69,13 @@ struct FileImportView: View {
                         setupAudioSession()
                     }
                     .onDisappear {
-                        // Stop speech when the view disappears
+                        // Stop speech and save progress when the view disappears.
                         speechService.stop()
-                        // When navigating away, release the security-scoped access.
-                        url.stopAccessingSecurityScopedResource()
+                        print("Saving bookmark at page index: \(currentPageIndex)")
+                        BookmarkManager.shared.saveBookmark(
+                            Bookmark(pageIndex: currentPageIndex, speechProgressLocation: 0),
+                            for: url
+                        )
                     }
             // 2. If not, show a button to pick one.
             } else {
@@ -109,7 +108,6 @@ struct FileImportView: View {
                     }
                     Button(role: .destructive) {
                         // Stop access and clear selection
-                        url.stopAccessingSecurityScopedResource()
                         selectedURL = nil
                         speechService.stop()
                     } label: {
