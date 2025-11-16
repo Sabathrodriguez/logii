@@ -29,6 +29,15 @@ struct FileImportView: View {
         _selectedURL = State(initialValue: url)
     }
     
+    func setupAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            print("Failed to set up audio session: \(error)")
+        }
+    }
+    
     func extractAttributedText(from url: URL, startingAt pageIndex: Int = 0) -> NSAttributedString? {
         guard let document = PDFDocument(url: url) else { return nil }
         let result = NSMutableAttributedString()
@@ -52,11 +61,16 @@ struct FileImportView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .ignoresSafeArea(edges: .all)
                     .onAppear {
+                        // Start accessing the security-scoped resource every time the view appears.
+                        let didStartAccessing = url.startAccessingSecurityScopedResource()
+                        if !didStartAccessing { print("Failed to start access for \(url.lastPathComponent)") }
+
                         // Load the most recent bookmark every time the view appears.
                         let pageToLoad = BookmarkManager.shared.loadBookmark(for: url)?.pageIndex ?? 0
                         self.initialPageIndex = pageToLoad
                         self.currentPageIndex = pageToLoad
                         print("View appeared. Loaded bookmark for page index: \(pageToLoad)")
+                        setupAudioSession()
                     }
                     .onDisappear {
                         // Stop speech when the view disappears

@@ -47,16 +47,8 @@ struct LibraryView: View {
             // 3. When the user picks a file, save its URL
             switch result {
             case .success(let url):
-                
-                // --- (THE "START") ---
-                // "Use the key to unlock the door"
-                // We must do this *before* we try to display the URL
-                let didStartAccessing = url.startAccessingSecurityScopedResource()
-                
-                if !didStartAccessing {
-                    print("Failed to start security access for \(url.lastPathComponent)")
-                    // Here you would show an error to the user
-                }
+                // We no longer need to start access here. We'll do it in the FileImportView
+                // just before we need to display the file.
                 
                 // if all checks passed, add url to pdfURL's array
                 pdfURLs.append(url)
