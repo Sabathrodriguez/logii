@@ -1,64 +1,91 @@
-//
-//  SpeechService.swift
-//  Logii
-//
-//  Created by Sabath  Rodriguez on 11/10/25.
-//
-
 import Foundation
 import AVFoundation
 import SwiftUI
 import Combine
 
-// 1. Must be NSObject to be a delegate, and ObservableObject to update the UI
 class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     
     private let ttsSynthesizer = AVSpeechSynthesizer()
-    
-    // 2. The full text to be spoken
     private var fullText: String = ""
     
-    // 3. The "Bookmark"
-    //    We publish this so you could even make a progress bar later
-    @Published var speechProgress: NSRange = NSRange(location: 0, length: 0)
+    // 1. FIX SYNC: Track how much text we have already spoken in previous sessions
+    private var currentUtteranceOffset: Int = 0
     
-    // 4. Published state for your UI
+    @Published var rate: Float = 0.5
     @Published var isSpeaking: Bool = false
+    @Published var availableVoices: [AVSpeechSynthesisVoice] = []
+    @Published var selectedVoice: AVSpeechSynthesisVoice? = AVSpeechSynthesisVoice(language: "en-US")
+
+    // 2. FIX SCROLLING: Remove @Published. Use a Subject so only the PDFView listens, not the whole UI.
+    var speechProgress: NSRange = NSRange(location: 0, length: 0)
+    let speechProgressPublisher = PassthroughSubject<NSRange, Never>()
+    
+    private var cancellables = Set<AnyCancellable>()
     
     override init() {
         super.init()
-        // 5. Set this class as the delegate
         self.ttsSynthesizer.delegate = self
+        loadVoices()
+        
+        // Watch for voice changes to auto-restart
+        $selectedVoice
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.restartIfActive()
+            }
+            .store(in: &cancellables)
     }
     
-    // --- PUBLIC COMMANDS ---
+    private func loadVoices() {
+        self.availableVoices = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language.starts(with: "en") }
+            .sorted { $0.name < $1.name }
+        
+//        if let premium = availableVoices.first(where: { $0.quality == .premium }) {
+//            self.selectedVoice = premium
+//        } else {
+//            self.selectedVoice = availableVoices.first
+//        }
+    }
     
-    func speakFromBeginning(text: String, rate: Float) {
+    private func restartIfActive() {
+        if isSpeaking || ttsSynthesizer.isPaused {
+            ttsSynthesizer.stopSpeaking(at: .immediate)
+            playOrResume()
+        }
+    }
+    
+    func speakFromBeginning(text: String) {
         ttsSynthesizer.stopSpeaking(at: .immediate)
+        
         self.fullText = text
-        self.speechProgress = NSRange(location: 0, length: 0) // Reset bookmark
+        self.speechProgress = NSRange(location: 0, length: 0)
+        self.currentUtteranceOffset = 0 // Reset offset
         
         let utterance = AVSpeechUtterance(string: self.fullText)
-        utterance.rate = rate
-        utterance.voice = AVSpeechSynthesisVoice(identifier: "com.apple.speech.synthesis.voice.siri_female_en-US_enhanced")
+        utterance.rate = self.rate
+        utterance.voice = selectedVoice
         
         ttsSynthesizer.speak(utterance)
     }
-    
-    func playOrResume(rate: Float) {
+        
+    func playOrResume() {
         if ttsSynthesizer.isPaused {
-            // It was just paused, so continue
             ttsSynthesizer.continueSpeaking()
         } else if !self.fullText.isEmpty {
-            // It was stopped, so start a new speech from the bookmarked location
-            ttsSynthesizer.stopSpeaking(at: .immediate) // Clear old one first
+            ttsSynthesizer.stopSpeaking(at: .immediate)
             
-            // 6. Get the *remaining* text from the bookmark
-            let remainingText = (self.fullText as NSString).substring(from: self.speechProgress.location)
+            // Calculate where we are starting from
+            let startIndex = self.speechProgress.location
             
+            // FIX SYNC: Remember this starting point as our offset
+            self.currentUtteranceOffset = startIndex
+            
+            let remainingText = (self.fullText as NSString).substring(from: startIndex)
             let utterance = AVSpeechUtterance(string: remainingText)
-            utterance.rate = rate
-            utterance.voice = AVSpeechSynthesisVoice(identifier: "com.apple.speech.synthesis.voice.siri_female_en-US_enhanced")
+            utterance.rate = self.rate
+            utterance.voice = selectedVoice
             
             ttsSynthesizer.speak(utterance)
         }
@@ -72,49 +99,45 @@ class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         ttsSynthesizer.stopSpeaking(at: .immediate)
     }
     
-    // --- AVSPEECHSYNTHESIZER DELEGATE METHODS ---
+    // --- DELEGATE METHODS ---
     
-    // 7. THIS IS THE KEY: The synthesizer tells us where it's about to speak
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, willSpeakRangeOfSpeechString range: NSRange, utterance: AVSpeechUtterance) {
-        // Update our bookmark
+        // FIX SYNC: Add the offset to the current range
+        let globalLocation = range.location + currentUtteranceOffset
+        let globalRange = NSRange(location: globalLocation, length: range.length)
+        
         DispatchQueue.main.async {
-            self.speechProgress = range
+            self.speechProgress = globalRange
+            // FIX SCROLLING: Send update only to subscribers, don't trigger full objectWillChange
+            self.speechProgressPublisher.send(globalRange)
         }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async {
-            self.isSpeaking = true
-        }
+        DispatchQueue.main.async { self.isSpeaking = true }
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didPause utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async {
-            self.isSpeaking = false
-        }
+        DispatchQueue.main.async { self.isSpeaking = false }
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didContinue utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async {
-            self.isSpeaking = true
-        }
+        DispatchQueue.main.async { self.isSpeaking = true }
     }
     
-    // Called when speech is finished OR cancelled
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         DispatchQueue.main.async {
             self.isSpeaking = false
-            // Reset bookmark to the start
-            self.speechProgress = NSRange(location: 0, length: 0)
+            // REMOVED: self.speechProgress = NSRange(location: 0, length: 0)
+            // REMOVED: self.currentUtteranceOffset = 0
+            
+            // We do NOT reset the offsets here.
+            // If we are just changing voices, we need these values to persist.
+            // If we are starting a new document, `speakFromBeginning` will reset them for us.
         }
     }
     
-    // 8. IMPORTANT: Called by stopSpeaking().
-    //    We DON'T reset the bookmark here, because we want to save our spot.
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async {
-            self.isSpeaking = false
-        }
+        DispatchQueue.main.async { self.isSpeaking = false }
     }
 }
-

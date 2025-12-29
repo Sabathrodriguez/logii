@@ -12,9 +12,15 @@ import AVFoundation
 
 struct FileImportView: View {
     
+//    @State var selectedURL: URL?
+//    @State private var currentPageIndex: Int
+    
+    // NEW: Tracks where the current speech session started
+    @State private var speechStartPageIndex: Int = 0
+    
     @State var selectedURL: URL?
     @State var showFilePicker = false
-    @State private var currentPageIndex: Int = 0
+    @State private var currentPageIndex: Int
     @State var initialPageIndex: Int = 0
     
     @State var sliderValue: Double = 0.5
@@ -27,6 +33,12 @@ struct FileImportView: View {
         // This line takes the 'url' we pass in
         // and uses it to set the initial value of the '@State var selectedURL'
         _selectedURL = State(initialValue: url)
+        if let unwrappedURL = url {
+            currentPageIndex = BookmarkManager.shared.loadBookmark(for: unwrappedURL)?.pageIndex ?? 0
+            print("set page index from bookmark: \(currentPageIndex)")
+        } else {
+            currentPageIndex = 0
+        }
     }
     
     func setupAudioSession() {
@@ -41,11 +53,14 @@ struct FileImportView: View {
     func extractAttributedText(from url: URL, startingAt pageIndex: Int = 0) -> NSAttributedString? {
         guard let document = PDFDocument(url: url) else { return nil }
         let result = NSMutableAttributedString()
+        
         for i in pageIndex..<document.pageCount {
-            guard let page = document.page(at: i), // Start from the given page index
+            // MUST skip nil strings to match the cache logic above
+            guard let page = document.page(at: i),
                   let selection = page.string else { continue }
-            result.append(selection.isEmpty ? NSAttributedString(string: "") : NSAttributedString(string: selection))
-            result.append(NSAttributedString(string: "\n"))
+            
+            result.append(NSAttributedString(string: selection))
+            result.append(NSAttributedString(string: " "))
         }
         return result
     }
@@ -57,10 +72,16 @@ struct FileImportView: View {
             // PDF view
             // 1. If we have a URL, show the PDF.
             if let url = selectedURL {
-                PDFKitView(url: url, currentPageIndex: $currentPageIndex, initialPageIndex: initialPageIndex)
+                let _ = print("about to init pdfkitiew with current page index: \(currentPageIndex)")
+//                print("current page index (FileImportView body) before PDFKitView init: \(currentPageIndex)")
+                PDFKitView(url: url, currentPageIndex: $currentPageIndex, speechService: speechService, speechStartPageIndex: speechStartPageIndex)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .ignoresSafeArea(edges: .all)
                     .onAppear {
+                        // --- THIS IS THE FIX ---
+                        // Re-gain access every time the view appears. This is crucial for when
+                        // you navigate back from the library and the previous access was stopped.
+                        _ = url.startAccessingSecurityScopedResource()
                         // Load the most recent bookmark every time the view appears.
                         let pageToLoad = BookmarkManager.shared.loadBookmark(for: url)?.pageIndex ?? 0
                         self.initialPageIndex = pageToLoad
@@ -76,6 +97,7 @@ struct FileImportView: View {
                             Bookmark(pageIndex: currentPageIndex, speechProgressLocation: 0),
                             for: url
                         )
+                        url.stopAccessingSecurityScopedResource()
                     }
             // 2. If not, show a button to pick one.
             } else {
@@ -95,6 +117,7 @@ struct FileImportView: View {
                             Bookmark(pageIndex: currentPageIndex, speechProgressLocation: 0),
                             for: url
                         )
+                        initialPageIndex = currentPageIndex
                     } label: {
                         Label("Save Page", systemImage: "bookmark.fill")
                     }
@@ -108,34 +131,35 @@ struct FileImportView: View {
                     }
                     Button(role: .destructive) {
                         // Stop access and clear selection
+                        url.stopAccessingSecurityScopedResource()
                         selectedURL = nil
                         speechService.stop()
                     } label: {
                         Label("Close", systemImage: "xmark.circle")
                     }
-                    Button {                                                   
-                        let s: String = extractAttributedText(from: url)?.string ?? "N/A"
+                    Button {
+                        let textFromPage: String = extractAttributedText(from: url)?.string ?? "N/A"
                         
-                        speechService.speakFromBeginning(text: s, rate: Float(sliderValue))                        
+                        // NEW: Reset start index to 0 for full document read
+                        self.speechStartPageIndex = 0
                         
-                        print("s: \(s)")
+                        speechService.speakFromBeginning(text: textFromPage)
                     } label: {
                         Label("Read Current Doc", systemImage: "speaker")
                     }
+                    
                     Button {
-                        // Extract text starting from the current page
                         let textFromPage = extractAttributedText(from: url, startingAt: currentPageIndex)?.string ?? "N/A"
-                        speechService.speakFromBeginning(text: textFromPage, rate: Float(sliderValue))
-
-                        // --- THIS IS THE FIX ---
-                        // Sync the initialPageIndex with the current page so the view doesn't jump back.
-                        self.initialPageIndex = currentPageIndex
+                        speechService.speakFromBeginning(text: textFromPage)
+                        
+                        // NEW: Sync start index with current page
+                        self.speechStartPageIndex = currentPageIndex
+                        
+                        // Sync bookmark logic (existing)
                         BookmarkManager.shared.saveBookmark(
                             Bookmark(pageIndex: currentPageIndex, speechProgressLocation: 0),
                             for: url
                         )
-                        
-                        print("Reading from page \(currentPageIndex + 1)")
                     } label: {
                         Label("Read from This Page", systemImage: "text.book.closed")
                     }
@@ -182,49 +206,26 @@ struct FileImportView: View {
                         }
                         // 2. Attach the popover modifier to the Button
                         .popover(isPresented: $showPlaybackControls) {
-                            
-                            // 3. This is the content for the popover
-                            VStack(spacing: 15) {
-                                // A horizontal layout for the buttons
-                                HStack(spacing: 55) {
-                                    Button {
-                                        speechService.pause()
-                                    } label: {
-                                        Image(systemName: "pause.fill")
-                                    }
-                                    
-                                    Button {
-                                        speechService.playOrResume(rate: Float(sliderValue))
-                                    } label: {
-                                        Image(systemName: "play.fill")
-                                    }
-                                    
-                                    Button(role: .destructive) {
-                                        speechService.stop()
-                                    } label: {
-                                        Image(systemName: "stop.fill")
-                                    }
-                                }
-                                .font(.title2) // Make the buttons a bit bigger
+                            PlaybackControlsView(
+                                selectedVoice: $speechService.selectedVoice,
                                 
-                                // The slider
-                                VStack {
-                                    // I've added a specifier to format the number nicely
-                                    Text("Voice Speed: \(sliderValue, specifier: "%.2f")")
-                                        .font(.caption)
-                                    Slider(value: $sliderValue, in: 0.0...1.0, step: 0.05) { isEditing in
-                                        // This 'isEditing' boolean is the key.
-                                        // We only want to act when the user lets go (isEditing == false)
-                                        if !isEditing && speechService.isSpeaking {
-                                                // ...resume speech from the last bookmark with the new rate.
-                                                speechService.playOrResume(rate: Float(sliderValue))
-                                            }
-                                    }
+                                // Bind directly to speechService.rate
+                                speed: $speechService.rate,
+                                
+                                isPlaybackVisible: $showPlaybackControls,
+                                voices: speechService.availableVoices,
+                                isSpeaking: speechService.isSpeaking,
+                                onPlay: {
+                                    // No arguments needed anymore
+                                    speechService.playOrResume()
+                                },
+                                onPause: {
+                                    speechService.pause()
+                                },
+                                onStop: {
+                                    speechService.stop()
                                 }
-                            }
-                            .padding() // Adds nice spacing inside the popover
-                            // This line helps it look like a popover on iPhone
-                            .presentationCompactAdaptation(.popover)
+                            )
                         }
                         // --- END OF REPLACEMENT ---
                     }
