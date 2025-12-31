@@ -27,9 +27,6 @@ struct PDFKitView: UIViewRepresentable {
         
         context.coordinator.pdfView = pdfView
         
-        // Pre-calculate page lengths for stable highlighting
-        context.coordinator.buildPageCache(for: pdfView.document, startPage: speechStartPageIndex)
-        
         NotificationCenter.default.addObserver(
             context.coordinator,
             selector: #selector(Coordinator.handlePageChange),
@@ -45,15 +42,9 @@ struct PDFKitView: UIViewRepresentable {
         
         if pdfView.document?.documentURL != url {
             pdfView.document = PDFDocument(url: url)
-            // Re-build cache if doc changes
-            context.coordinator.buildPageCache(for: pdfView.document, startPage: speechStartPageIndex)
         }
         
-        // If the START page changes (e.g. user clicked "Read Current Doc" vs "Read Page"), rebuild cache
-        if context.coordinator.lastStartPage != speechStartPageIndex {
-            context.coordinator.buildPageCache(for: pdfView.document, startPage: speechStartPageIndex)
-        }
-        
+        // If the view was told to turn the page (e.g. auto-read moved to next page)
         if let document = pdfView.document,
            currentPageIndex < document.pageCount,
            let page = document.page(at: currentPageIndex),
@@ -73,12 +64,6 @@ struct PDFKitView: UIViewRepresentable {
          var parent: PDFKitView
          weak var pdfView: PDFView?
          private var cancellables = Set<AnyCancellable>()
-         
-         // CACHE: Stores (PageIndex: StartIndexInSpeechString)
-         // This ensures we don't recalculate page.string continuously
-         var pageStartIndices: [Int: Int] = [:]
-         var pageLengths: [Int: Int] = [:]
-         var lastStartPage: Int = -1
 
          init(parent: PDFKitView, speechService: SpeechService) {
              self.parent = parent
@@ -101,38 +86,6 @@ struct PDFKitView: UIViewRepresentable {
                  }
                  .store(in: &cancellables)
          }
-         
-         // In PDFKitView.swift -> Coordinator class
-
-         func buildPageCache(for document: PDFDocument?, startPage: Int) {
-             guard let document = document else { return }
-             
-             print("Building Page Cache starting at: \(startPage)")
-             self.lastStartPage = startPage
-             self.pageStartIndices.removeAll()
-             self.pageLengths.removeAll()
-             
-             var currentAccumulatedLength = 0
-             
-             for i in startPage..<document.pageCount {
-                 guard let page = document.page(at: i) else { continue }
-                 
-                 // 1. FIX: Skip pages with nil text, exactly like extractAttributedText does.
-                 // If we don't skip, we add a "phantom space" to the math that doesn't exist in the speech.
-                 guard let pageText = page.string else { continue }
-                 
-                 // Record start index
-                 pageStartIndices[i] = currentAccumulatedLength
-                 
-                 // 2. FIX: Use .utf16.count
-                 // AVSpeechSynthesizer works on NSString (UTF-16) lengths.
-                 // Swift's standard .count handles Emojis differently, causing drift.
-                 let length = pageText.utf16.count + 1 // +1 for the space we added
-                 
-                 pageLengths[i] = length
-                 currentAccumulatedLength += length
-             }
-         }
 
          // MARK: - Highlight Logic
          func highlightSpokenWord(range: NSRange) {
@@ -143,40 +96,16 @@ struct PDFKitView: UIViewRepresentable {
                  return
              }
              
-             // Find which page this range belongs to.
-             // Since we cached the start indices, we can just look it up.
-             // We iterate through our cached pages to find the fit.
+             // SIMPLIFIED: We know exactly which page to highlight
+             // because speechService is only reading one page at a time.
+             let pageIndex = parent.speechStartPageIndex
              
-             let startPage = parent.speechStartPageIndex
+             guard let page = document.page(at: pageIndex) else { return }
              
-             for i in startPage..<document.pageCount {
-                 guard let pageStart = pageStartIndices[i],
-                       let pageLength = pageLengths[i] else { continue }
-                 
-                 let pageEnd = pageStart + pageLength
-                 
-                 // Check if the current spoken index falls inside this page
-                 if range.location >= pageStart && range.location < pageEnd {
-                     
-                     // We found the page!
-                     guard let page = document.page(at: i) else { return }
-                     
-                     // Map Global Index -> Page Index
-                     let localStart = range.location - pageStart
-                     
-                     // Ensure we don't crash if localStart is out of bounds (safety)
-                     if localStart < 0 { return }
-                     
-                     // Create selection
-                     let localRange = NSRange(location: localStart, length: range.length)
-                     
-                     // Select
-                     if let selection = page.selection(for: localRange) {
-                         pdfView.setCurrentSelection(selection, animate: true)
-                     }
-                     
-                     break // Stop looking
-                 }
+             // The range is now local to this page.
+             // We assume AVSpeechSynthesizer range matches PDFKit text string range.
+             if let selection = page.selection(for: range) {
+                 pdfView.setCurrentSelection(selection, animate: true)
              }
          }
 
