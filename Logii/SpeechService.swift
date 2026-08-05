@@ -8,6 +8,12 @@ class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     private let ttsSynthesizer = AVSpeechSynthesizer()
     private var fullText: String = ""
     
+    // NEW: Tracks how much text was skipped if we resumed mid-page
+    private var currentUtteranceOffset: Int = 0
+    
+    // NEW: Counter to handle multiple rapid stops (like scrubbing)
+    private var explicitStopCount: Int = 0
+    
     // Callback to trigger the next page load
     var onDidFinishUtterance: (() -> Void)?
     
@@ -35,6 +41,15 @@ class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
                 self?.restartIfActive()
             }
             .store(in: &cancellables)
+            
+        // Watch for rate changes to auto-restart (Scrubbing logic)
+        $rate
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.restartIfActive()
+            }
+            .store(in: &cancellables)
     }
     
     private func loadVoices() {
@@ -43,18 +58,40 @@ class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
             .sorted { $0.name < $1.name }
     }
     
-    private func restartIfActive() {
-        if isSpeaking || ttsSynthesizer.isPaused {
+    // Helper to safely stop without triggering page turns
+    private func stopAndIgnoreFinish() {
+        // Only count it if the synthesizer is actually doing something that will trigger didFinish
+        if ttsSynthesizer.isSpeaking || ttsSynthesizer.isPaused {
+            explicitStopCount += 1
             ttsSynthesizer.stopSpeaking(at: .immediate)
+        }
+    }
+    
+    private func restartIfActive() {
+        // If we are currently active, stop (ignoring finish) and resume
+        if isSpeaking || ttsSynthesizer.isPaused {
+            stopAndIgnoreFinish()
             playOrResume()
         }
     }
     
     func speakFromBeginning(text: String) {
-        ttsSynthesizer.stopSpeaking(at: .immediate)
+        // Stop any previous speech without triggering next page
+        stopAndIgnoreFinish()
         
         self.fullText = text
         self.speechProgress = NSRange(location: 0, length: 0)
+        self.currentUtteranceOffset = 0
+        
+        // Ensure count is clean for new speech if it somehow got desynced
+        // (Though strictly relying on increment/decrement is safer, resetting here ensures we don't block the new speech)
+        // Only reset if we are sure we are stopped.
+        // Actually, safer to let the logic flow, but forcing 0 here resets state for the NEW page.
+        // Any pending 'didFinish' from the previous page stop should have been caught by stopAndIgnoreFinish above.
+        // However, since we are starting FRESH, we want to respect the stop count for the stop we just issued,
+        // but ensure we are ready for the new finish.
+        // The safest approach: The stopAndIgnoreFinish() incremented the count. The pending didFinish will decrement it.
+        // So we don't reset explicitStopCount here.
         
         let utterance = AVSpeechUtterance(string: self.fullText)
         utterance.rate = self.rate
@@ -67,21 +104,30 @@ class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
         if ttsSynthesizer.isPaused {
             ttsSynthesizer.continueSpeaking()
         } else if !self.fullText.isEmpty {
-            ttsSynthesizer.stopSpeaking(at: .immediate)
             
-            // Resume from where we left off in the current page text
+            // If we are already speaking, stop first (ignoring finish)
+            stopAndIgnoreFinish()
+            
+            // Resume from where we left off
             let startIndex = self.speechProgress.location
-            let remainingText = (self.fullText as NSString).substring(from: startIndex)
             
-            let utterance = AVSpeechUtterance(string: remainingText)
-            utterance.rate = self.rate
-            utterance.voice = selectedVoice
-            
-            // Important: We must not forget to map the delegate callbacks back to the original string indices
-            // But since we are only doing simple page-by-page, the drift is minimal.
-            // For perfect pausing, we'd need an offset, but let's keep it simple for this step.
-            
-            ttsSynthesizer.speak(utterance)
+            // Safety check
+            if startIndex < fullText.count {
+                let remainingText = (self.fullText as NSString).substring(from: startIndex)
+                
+                // SAVE THE OFFSET!
+                self.currentUtteranceOffset = startIndex
+                
+                let utterance = AVSpeechUtterance(string: remainingText)
+                utterance.rate = self.rate
+                utterance.voice = selectedVoice
+                
+                ttsSynthesizer.speak(utterance)
+            } else {
+                 // End of text, treat as natural finish? Or just stop.
+                 // If we consider it natural finish, we might loop. Let's just stop.
+                 self.isSpeaking = false
+            }
         }
     }
     
@@ -90,18 +136,21 @@ class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     }
     
     func stop() {
-        ttsSynthesizer.stopSpeaking(at: .immediate)
+        stopAndIgnoreFinish()
+        self.currentUtteranceOffset = 0
     }
     
     // --- DELEGATE METHODS ---
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, willSpeakRangeOfSpeechString range: NSRange, utterance: AVSpeechUtterance) {
-        // If we resumed (substring), we might need to adjust 'range.location' by adding the start offset.
-        // For this specific implementation, we rely on the fact that we process one page at a time.
         
         DispatchQueue.main.async {
-            self.speechProgress = range
-            self.speechProgressPublisher.send(range)
+            // Add the offset back to the range location
+            let correctedLocation = range.location + self.currentUtteranceOffset
+            let correctedRange = NSRange(location: correctedLocation, length: range.length)
+            
+            self.speechProgress = correctedRange
+            self.speechProgressPublisher.send(correctedRange)
         }
     }
 
@@ -120,12 +169,28 @@ class SpeechService: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
         DispatchQueue.main.async {
             self.isSpeaking = false
-            // Notify that this specific page is done
-            self.onDidFinishUtterance?()
+            
+            // CRITICAL FIX WITH COUNTER:
+            if self.explicitStopCount > 0 {
+                // This finish was caused by our code (stop/scrub).
+                // Ignore it and decrement the counter.
+                self.explicitStopCount -= 1
+            } else {
+                // This was a natural finish (end of page).
+                // Load the next page.
+                self.currentUtteranceOffset = 0
+                self.onDidFinishUtterance?()
+            }
         }
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        DispatchQueue.main.async { self.isSpeaking = false }
+        DispatchQueue.main.async {
+            self.isSpeaking = false
+            self.currentUtteranceOffset = 0
+            // Cancel usually means we don't want to proceed.
+            // We can clear the count here to be safe.
+            self.explicitStopCount = 0
+        }
     }
 }
